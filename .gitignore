@@ -1,0 +1,4 @@
+sensor-worker/output
+node_modules
+*.out
+*.o
