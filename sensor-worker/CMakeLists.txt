@@ -7,6 +7,7 @@ add_executable(
   main.c 
   workers.c 
   command_worker.c 
+  file_worker.c
   realtime_stream_worker.c
 )
 
