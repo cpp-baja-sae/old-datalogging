@@ -16,38 +16,6 @@
 
 static volatile int continue_flag = 1;
 
-#include "ads8588h/defines.h"
-
-#define FILE_BLOCK_SIZE 4096 // Write to the file in 4k blocks.
-#define FILE_BUFFER_SIZE (BATCH_SIZE * FILE_BLOCK_SIZE)
-// How many additional versions of the file to create with sequentially lower
-// resolutions.
-#define NUM_AUX_LODS 7 
-// How much the sample rate should be divided for each sequential file.
-#define LOD_SAMPLE_INTERVAL 4
-
-// The name of the socket to be created to allow this program to talk to other
-// programs on the pi, allowing it to be controlled from outside. This socket
-// is used by the web server to change settings and check status. IPC stands
-// for Inter-Process Communication.
-#define IPC_ID "/tmp/.crunch_ipc"
-// Same as above, but this socket is used to stream real-time data. Using two
-// separate sockets simplifies communication protocols. The above socket mostly
-// does small 32-byte long requests / responses, like a conversation. This
-// socket just constantly yells data at whoever wants to listen.
-#define IPC_STREAM_ID "/tmp/.crunch_stream"
-#define IPC_COMMAND_STOP 'x'
-#define IPC_COMMAND_BEGIN_FILE 'b'
-#define IPC_COMMAND_END_FILE 'e'
-#define IPC_COMMAND_GET_CONFIG 'c'
-#define IPC_COMMAND_SET_STREAM_INTERVAL 'i'
-// For simplicity's sake, we always send responses of a fixed size in response
-// to messages received over the IPC socket.
-#define IPC_RESPONSE_SIZE 32
-
-// Must not end with a slash.
-const char *output_dir = "/root/datalogs";
-
 FILE *primary_file;
 char primary_file_buffer[FILE_BUFFER_SIZE];
 int pbuf_read_index = 0;
@@ -55,10 +23,10 @@ int pbuf_stream_index = 0;
 int pbuf_write_index = 0;
 
 struct LodInfo {
-    int min_buffer[NUM_ADCS * NUM_CHANNELS];
-    int max_buffer[NUM_ADCS * NUM_CHANNELS];
-    int avg_buffer[NUM_ADCS * NUM_CHANNELS];
-    // How many batches have been accumulated in the three buffers.
+    int min_buffer[FRAME_LEN];
+    int max_buffer[FRAME_LEN];
+    int avg_buffer[FRAME_LEN];
+    // How many frames have been accumulated in the three buffers.
     int progress; 
 
     FILE *target_file;
@@ -72,7 +40,7 @@ struct LodInfo {
 } lod_infos[NUM_AUX_LODS];
 
 int write_to_file_flag = 1;
-int stream_batch_interval = 100; // Only stream every [var]th batch.
+int stream_frame_interval = 100; // Only stream every [var]th frame.
 
 void begin_data_log_file() {
     printf("[WRITER] Starting new file.\n");
@@ -160,9 +128,9 @@ void *file_worker(void *args) {
         // Every time write_to_file_flag is set, a new file is created.
         if (write_to_file_flag) {
             begin_data_log_file();
-            // Skip to the most currently written batch.
+            // Skip to the most currently written frame.
             pbuf_read_index = pbuf_write_index;
-            pbuf_read_index -= pbuf_stream_index % BATCH_SIZE;
+            pbuf_read_index -= pbuf_stream_index % FRAME_SIZE;
             while (continue_flag && write_to_file_flag) {
                 update_files();
                 usleep(4000);
@@ -199,7 +167,7 @@ void initialize() {
 
 void reset_lod_buffer(int lod_index) {
     lod_infos[lod_index].progress = 0;
-    for (int val_index = 0; val_index < NUM_ADCS * NUM_CHANNELS; val_index++) {
+    for (int val_index = 0; val_index < FRAME_LEN; val_index++) {
         lod_infos[lod_index].min_buffer[val_index] = 0xFFFF;
         lod_infos[lod_index].max_buffer[val_index] = 0;
         lod_infos[lod_index].avg_buffer[val_index] = 0;
@@ -211,13 +179,13 @@ void commit_lod(int lod_index) {
     // We wait to do this step until after we have written every value because
     // it gives us higher precision.
     struct LodInfo *this_lod = &lod_infos[lod_index];
-    for (int val_index = 0; val_index < NUM_CHANNELS * NUM_ADCS; val_index++) {
+    for (int val_index = 0; val_index < FRAME_LEN; val_index++) {
         (*this_lod).avg_buffer[val_index] /= LOD_SAMPLE_INTERVAL;
     }
     // If this is not the highest-level LOD, then update the next LOD's min, max, and avg.
     if (lod_index < NUM_AUX_LODS - 1) {
         struct LodInfo *next_lod = &lod_infos[lod_index + 1];
-        for (int val_index = 0; val_index < NUM_CHANNELS * NUM_ADCS; val_index++) {
+        for (int val_index = 0; val_index < FRAME_LEN; val_index++) {
             if (this_lod->min_buffer[val_index] < next_lod->min_buffer[val_index]) {
                 next_lod->min_buffer[val_index] = this_lod->min_buffer[val_index];
             }
@@ -231,22 +199,22 @@ void commit_lod(int lod_index) {
             commit_lod(lod_index + 1);
         }
     }
-    // Write new values to file buffer. We have to separate them into three batches to make sure
+    // Write new values to file buffer. We have to separate them into three frames to make sure
     // it writes correctly to the file buffer. The file buffer size is a multiple of two, but it
     // is not a multiple of six, so we cannot write them all at once.
-    for (int val_index = 0; val_index < NUM_CHANNELS * NUM_ADCS; val_index++) {
+    for (int val_index = 0; val_index < FRAME_LEN; val_index++) {
         int write_index = (*this_lod).fbuf_write_index;
         (*this_lod).file_buffer[write_index + 0] = (*this_lod).min_buffer[val_index] >> 8;
         (*this_lod).file_buffer[write_index + 1] = (*this_lod).min_buffer[val_index] & 0xFF;
         (*this_lod).fbuf_write_index = (write_index + 2) % FILE_BUFFER_SIZE;
     }
-    for (int val_index = 0; val_index < NUM_CHANNELS * NUM_ADCS; val_index++) {
+    for (int val_index = 0; val_index < FRAME_LEN; val_index++) {
         int write_index = (*this_lod).fbuf_write_index;
         (*this_lod).file_buffer[write_index + 0] = (*this_lod).max_buffer[val_index] >> 8;
         (*this_lod).file_buffer[write_index + 1] = (*this_lod).max_buffer[val_index] & 0xFF;
         (*this_lod).fbuf_write_index = (write_index + 2) % FILE_BUFFER_SIZE;
     }
-    for (int val_index = 0; val_index < NUM_CHANNELS * NUM_ADCS; val_index++) {
+    for (int val_index = 0; val_index < FRAME_LEN; val_index++) {
         int write_index = (*this_lod).fbuf_write_index;
         (*this_lod).file_buffer[write_index + 0] = (*this_lod).avg_buffer[val_index] >> 8;
         (*this_lod).file_buffer[write_index + 1] = (*this_lod).avg_buffer[val_index] & 0xFF;
@@ -317,18 +285,18 @@ void run_command(
         // 1: NUM_ADCS
         // 2: NUM_CHANNELS (per adc)
         // 3: 0x01 if currently writing to a file.
-        // 4-5: stream_batch_interval
+        // 4-5: stream_frame_interval
         (*response)[1] = NUM_ADCS;
         (*response)[2] = NUM_CHANNELS;
         (*response)[3] = write_to_file_flag;
-        (*response)[4] = stream_batch_interval >> 8;
-        (*response)[5] = stream_batch_interval % 0xFF;
+        (*response)[4] = stream_frame_interval >> 8;
+        (*response)[5] = stream_frame_interval % 0xFF;
         break;
     case IPC_COMMAND_SET_STREAM_INTERVAL:
         printf("[SOCKET] Received change stream interval command.\n");
         // 1 byte for command, 2 bytes for value to change to.
         if (message_length == 3) {
-            stream_batch_interval = message[0] << 8 | message[1];
+            stream_frame_interval = message[1] << 8 | message[2];
         } else {
             printf(
                 "[SOCKET] Error, message length must be 3 for this command.\n"
@@ -458,7 +426,7 @@ void *socket_worker(void *args) {
 }
 
 int send_unstreamed_data(int client_fd) {
-    int sample_interval = stream_batch_interval * BATCH_SIZE;
+    int sample_interval = stream_frame_interval * FRAME_SIZE;
     int unwritten_bytes;
     if (pbuf_stream_index == pbuf_write_index) {
         unwritten_bytes = 0;
@@ -475,7 +443,7 @@ int send_unstreamed_data(int client_fd) {
 
     while (unwritten_bytes > sample_interval) {
         int result 
-            = write(client_fd, &primary_file_buffer[pbuf_stream_index], BATCH_SIZE);
+            = write(client_fd, &primary_file_buffer[pbuf_stream_index], FRAME_SIZE);
         if (result < 0) {
             // We failed to write, the client has probably disconnected.
             return 0;
@@ -528,9 +496,9 @@ void *realtime_stream_worker(void *args) {
             continue;
         }
         printf("[STREAM] Accepted an incoming connection.\n");
-        // Skip to the most currently written batch.
+        // Skip to the most currently written frame.
         pbuf_stream_index = pbuf_write_index;
-        pbuf_stream_index -= pbuf_stream_index % BATCH_SIZE;
+        pbuf_stream_index -= pbuf_stream_index % FRAME_SIZE;
         while (continue_flag && send_unstreamed_data(client_fd)) {
             usleep(1000);
         }
@@ -557,15 +525,15 @@ int main() {
         lod_infos[lod].fbuf_write_index = 0;
         reset_lod_buffer(lod);
     }
-    // Set up the block sizes for each lod. LOD 6 writes about 1 batch every
+    // Set up the block sizes for each lod. LOD 6 writes about 1 frame every
     // second. 
     lod_infos[0].file_write_block_size = FILE_BLOCK_SIZE;
     lod_infos[1].file_write_block_size = FILE_BLOCK_SIZE;
     lod_infos[2].file_write_block_size = FILE_BLOCK_SIZE;
-    lod_infos[3].file_write_block_size = BATCH_SIZE * 16;
-    lod_infos[4].file_write_block_size = BATCH_SIZE * 4;
-    lod_infos[5].file_write_block_size = BATCH_SIZE;
-    lod_infos[6].file_write_block_size = BATCH_SIZE;
+    lod_infos[3].file_write_block_size = FRAME_SIZE * 16;
+    lod_infos[4].file_write_block_size = FRAME_SIZE * 4;
+    lod_infos[5].file_write_block_size = FRAME_SIZE;
+    lod_infos[6].file_write_block_size = FRAME_SIZE;
 
     pthread_t file_worker_id;
     pthread_create(&file_worker_id, NULL, file_worker, NULL);

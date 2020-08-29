@@ -12,7 +12,7 @@ int create_tx_waveform() {
     };
 
     int time_offset = 0;
-    for (int cycle = 0; cycle < NUM_CYCLES; cycle++) {
+    for (int cycle = 0; cycle < ADC_FRAME_BUFFER_LEN; cycle++) {
         char data_buf[NUM_CHANNELS * 2 + 1];
         for (int i = 0; i < NUM_CHANNELS * 2; i++) {
             data_buf[i] = 0xFF;
@@ -75,7 +75,7 @@ int create_tx_waveform() {
         time_offset += CYCLE_TIME;
     }
 
-    // These two pulses do nothing for CYCLE_TIME * NUM_CYCLES microseconds.
+    // These two pulses do nothing for CYCLE_TIME * ADC_FRAME_BUFFER_LEN microseconds.
     // This ensures that there is still a delay after the last transaction
     // before the whole waveform starts over again.
     gpioPulse_t end_padding[2];
@@ -109,7 +109,7 @@ void sensor_read_loop() {
     // the highest is the end.
     int bottom_cb = waveform_info.botCB;
     int num_cbs = waveform_info.numCB;
-    int cbs_per_cycle = num_cbs / NUM_CYCLES;
+    int cbs_per_cycle = num_cbs / ADC_FRAME_BUFFER_LEN;
 
     // OOLs (no idea what it stands for) store values read from pins. Each
     // OOL stores a 32-bit field containing the value of every GPIO pin at
@@ -124,7 +124,7 @@ void sensor_read_loop() {
     int values[NUM_ADCS * NUM_CHANNELS];
     while (continue_flag) {
         int current_cycle_in_progress 
-            = (rawWaveCB() - bottom_cb) / cbs_per_cycle % NUM_CYCLES;
+            = (rawWaveCB() - bottom_cb) / cbs_per_cycle % ADC_FRAME_BUFFER_LEN;
 
         int cycles_read = 0;
         while (reading_from != current_cycle_in_progress) {
@@ -196,13 +196,13 @@ void sensor_read_loop() {
                 commit_lod(0);
             }
 
-            reading_from = (reading_from + 1) % NUM_CYCLES;
+            reading_from = (reading_from + 1) % ADC_FRAME_BUFFER_LEN;
             cycles_read += 1;
         }
-        if (cycles_read > NUM_CYCLES / 2 + NUM_CYCLES / 4) {
+        if (cycles_read > ADC_FRAME_BUFFER_LEN / 2 + ADC_FRAME_BUFFER_LEN / 4) {
             printf(
                 "[SENSOR] WARNING: Data buffer was pretty full. (%i/%i)\n",
-                cycles_read, NUM_CYCLES
+                cycles_read, ADC_FRAME_BUFFER_LEN 
             );
         }
         usleep(500);
