@@ -9,6 +9,7 @@ add_executable(
   command_worker.c 
   file_worker.c
   realtime_stream_worker.c
+  sensor_read_worker.c
 )
 
 # Default communication library for raspi chipset, has low-level functions
