@@ -13,8 +13,7 @@
 #include <unistd.h> // For sleep command.
 
 #include "config.h"
-
-static volatile int continue_flag = 1;
+#include "workers.h"
 
 FILE *primary_file;
 char primary_file_buffer[FILE_BUFFER_SIZE];
@@ -39,16 +38,13 @@ struct LodInfo {
     int file_write_block_size;
 } lod_infos[NUM_AUX_LODS];
 
-int write_to_file_flag = 1;
-int stream_frame_interval = 100; // Only stream every [var]th frame.
-
 void begin_data_log_file() {
     printf("[WRITER] Starting new file.\n");
 
     uint64_t timestamp = (uint64_t) time(NULL);
     // 400 is kind of overkill, just being safe.
     char folder_name[400], file_name[400]; 
-    sprintf(folder_name, "%s/datalog_%.20lli", output_dir, timestamp);
+    sprintf(folder_name, "%s/datalog_%.20lli", OUTPUT_DIR, timestamp);
     mkdir(folder_name, 0755);
 
     // Write basic information.
@@ -254,177 +250,6 @@ void *sensor_read_worker(void *args) {
     gpioTerminate();
 }
 
-void run_command(
-    char command, 
-    char *message, 
-    int message_length, 
-    char **response, 
-    int *response_length
-) {
-    *response_length = IPC_RESPONSE_SIZE;
-    *response = malloc(IPC_RESPONSE_SIZE);
-    memset(*response, '\0', IPC_RESPONSE_SIZE);
-    (*response)[0] = command;
-
-    switch (command) {
-    case IPC_COMMAND_STOP:
-        printf("[SOCKET] Received stop command.\n");
-        continue_flag = 0;
-        break;
-    case IPC_COMMAND_BEGIN_FILE:
-        printf("[SOCKET] Received begin file command.\n");
-        write_to_file_flag = 1;
-        break;
-    case IPC_COMMAND_END_FILE:
-        printf("[SOCKET] Received end file command.\n");
-        write_to_file_flag = 0;
-        break;
-    case IPC_COMMAND_GET_CONFIG:
-        printf("[SOCKET] Received get config command.\n");
-        // Response format:
-        // 1: NUM_ADCS
-        // 2: NUM_CHANNELS (per adc)
-        // 3: 0x01 if currently writing to a file.
-        // 4-5: stream_frame_interval
-        (*response)[1] = NUM_ADCS;
-        (*response)[2] = NUM_CHANNELS;
-        (*response)[3] = write_to_file_flag;
-        (*response)[4] = stream_frame_interval >> 8;
-        (*response)[5] = stream_frame_interval % 0xFF;
-        break;
-    case IPC_COMMAND_SET_STREAM_INTERVAL:
-        printf("[SOCKET] Received change stream interval command.\n");
-        // 1 byte for command, 2 bytes for value to change to.
-        if (message_length == 3) {
-            stream_frame_interval = message[1] << 8 | message[2];
-        } else {
-            printf(
-                "[SOCKET] Error, message length must be 3 for this command.\n"
-            );
-        }
-        break;
-    default:
-        printf("[SOCKET] Invalid IPC command: %c.\n", command);
-        break;
-    }
-}
-
-void *socket_worker(void *args) {
-    int socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (socket_fd < 0) {
-        printf("[SOCKET] Failed to create socket.\n");
-        exit(1);
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr)); // Clear everything.
-    addr.sun_family = AF_UNIX; // Local Unix socket, not an inet socket.
-    // Set the socket's path to be IPC_ID.
-    strncpy(addr.sun_path, IPC_ID, sizeof(addr.sun_path) - 1);
-    // Unbind any existing socket. This is bad practice if more than one
-    // instance of the application is running at a time, but we won't be doing
-    // that.
-    unlink(IPC_ID);
-    // Bind the socket that was created to the address we just specified.
-    int result = bind(socket_fd, (struct sockaddr*) &addr, sizeof(addr));
-    if (result < 0) {
-        printf("[SOCKET] Failed to bind socket, error code %i.\n", errno);
-        exit(1);
-    }
-    
-    // Allow up to 5 clients to wait to connect.
-    if (listen(socket_fd, 5) < 0) {
-        printf("[SOCKET] Failed to listen(), error code %i.\n", errno);
-        exit(1);
-    }
-
-    printf("[SOCKET] Setup complete.\n");
-
-    char buffer[1];
-    while (continue_flag) {
-        struct sockaddr_un client_addr;
-        int addr_len = sizeof(client_addr);
-        printf("[SOCKET] Waiting for connection.\n");
-        int client_fd = accept(
-            socket_fd, 
-            (struct sockaddr*) 
-            &client_addr, 
-            &addr_len
-        );
-        if (client_fd < 0) {
-            printf("[SOCKET] Bad connection attempt, error code %i.\n", errno);
-            // This is a recoverable error.
-            continue;
-        }
-        printf("[SOCKET] Accepted an incoming connection.\n");
-        while (continue_flag) {
-            // The first byte is the length of the message.
-            char length = '\0';
-            int result = read(client_fd, &length, 1);
-            if (result < 0) {
-                printf("[SOCKET] Could not read message from client, ");
-                printf("error code %i.\n", errno);
-                // The client may have disconnected. Try to connect to a new
-                // client.
-                break;
-            }
-            int ilength = (int) length;
-            if (ilength <= 0) {
-                printf("[SOCKET] Messages cannot be zero bytes long.\n");
-                // It is possible the client disconnected.
-                break;
-            }
-
-            char *message = (char*) malloc(ilength);
-            int real_length = read(client_fd, message, ilength);
-            if (real_length < 0) {
-                printf("[SOCKET] Could not read message from client, ");
-                printf("error code %i.\n", errno);
-                free(message);
-                break;
-            }
-            if (real_length != ilength) {
-                printf(
-                    "[SOCKET] Expected %i bytes, but got %i bytes.\n",
-                    ilength,
-                    real_length
-                );
-                free(message);
-                continue;
-            }
-
-            // First byte of the message is which command to use.
-            char command = message[0];
-            char *response;
-            int response_length;
-            run_command(command, message, ilength, &response, &response_length);
-
-            if (write(client_fd, response, response_length) < 0) {
-                printf(
-                    "[SOCKET] Failed to send response, error code %i.\n",
-                    errno
-                );
-                free(message);
-                free(response);
-                break;
-            }
-            free(message);
-            free(response);
-        }
-        close(client_fd);
-    }
-
-    if (close(socket_fd) < 0) {
-        printf("[SOCKET] Unable to close socket, error code %i.\n", errno);
-        return NULL;
-    } 
-    if (unlink(IPC_ID) < 0) {
-        printf("[SOCKET] Unable to unlink socket, error code %i.\n", errno);
-        return NULL;
-    } 
-    printf("[SOCKET] Successfully cleaned up socket.\n");
-}
-
 int send_unstreamed_data(int client_fd) {
     int sample_interval = stream_frame_interval * FRAME_SIZE;
     int unwritten_bytes;
@@ -539,8 +364,8 @@ int main() {
     pthread_create(&file_worker_id, NULL, file_worker, NULL);
     pthread_t sensor_worker_id;;
     pthread_create(&sensor_worker_id, NULL, sensor_read_worker, NULL);
-    pthread_t socket_worker_id;;
-    pthread_create(&socket_worker_id, NULL, socket_worker, NULL);
+    pthread_t command_worker_id;;
+    pthread_create(&command_worker_id, NULL, command_worker, NULL);
     pthread_t stream_worker_id;;
     pthread_create(&stream_worker_id, NULL, realtime_stream_worker, NULL);
     printf("[MAIN  ] Started all workers.\n");
@@ -549,8 +374,8 @@ int main() {
     pthread_join(sensor_worker_id, NULL);
     // This worker might hang waiting for connections, we should manually
     // cancel it.
-    pthread_cancel(socket_worker_id);
-    pthread_join(socket_worker_id, NULL);
+    pthread_cancel(command_worker_id);
+    pthread_join(command_worker_id, NULL);
     // Same thing here.
     pthread_cancel(stream_worker_id);
     pthread_join(stream_worker_id, NULL);

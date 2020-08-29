@@ -1,3 +1,6 @@
+#ifndef CONFIG_H_
+#define CONFIG_H_
+
 //==============================================================================
 // ADC-SPECIFIC CONSTANTS
 //==============================================================================
@@ -82,4 +85,6 @@
 #define IPC_RESPONSE_SIZE 32
 
 // Must not end with a slash
-const char *output_dir = "/root/datalogs";
+#define OUTPUT_DIR "/root/datalogs"
+
+#endif

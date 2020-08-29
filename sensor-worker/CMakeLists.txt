@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 
 project(crunch C)
 
-add_executable(crunch main.c)
+add_executable(crunch main.c workers.c command_worker.c)
 
 # Default communication library for raspi chipset, has low-level functions
 # allowing for super-fast reads / writes with the ADC.
